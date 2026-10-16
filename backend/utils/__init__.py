@@ -11,6 +11,20 @@ from .file_utils import (
     ensure_within_directory,
     sanitize_filename,
 )
+from .office_sniff import (
+    OOXML_EXTENSIONS,
+    EncryptedDocumentError,
+    OfficeSniffResult,
+    encrypted_document_message,
+    sniff_office_file,
+)
+from .doc_decrypt import (
+    OFFICE_EXTENSIONS,
+    DocDecryptError,
+    cleanup_decrypted,
+    decrypted_dir,
+    decrypt_if_needed,
+)
 
 __all__ = [
     "convert_pdf_to_images",
@@ -23,4 +37,14 @@ __all__ = [
     "FilenameValidationError",
     "ensure_within_directory",
     "sanitize_filename",
+    "OOXML_EXTENSIONS",
+    "EncryptedDocumentError",
+    "OfficeSniffResult",
+    "encrypted_document_message",
+    "sniff_office_file",
+    "OFFICE_EXTENSIONS",
+    "DocDecryptError",
+    "cleanup_decrypted",
+    "decrypted_dir",
+    "decrypt_if_needed",
 ]

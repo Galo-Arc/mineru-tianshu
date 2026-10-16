@@ -139,9 +139,21 @@ export const useTaskStore = defineStore('task', () => {
   /**
    * 重试任务
    */
-  async function retryTask(taskId: string) {
+  async function deleteTask(taskId: string) {
     try {
-      await taskApi.retryTask(taskId)
+      await taskApi.deleteTask(taskId)
+      // 从列表中移除该任务
+      const idx = tasks.value.findIndex(t => t.task_id === taskId)
+      if (idx >= 0) { tasks.value.splice(idx, 1); total.value = Math.max(0, total.value - 1) }
+    } catch (err: any) {
+      error.value = err.message || t('task.deleteFailed')
+      throw err
+    }
+  }
+
+  async function retryTask(taskId: string, password?: string) {
+    try {
+      await taskApi.retryTask(taskId, password)
       // 重试后状态变为 pending，清除错误信息
       const task = tasks.value.find(t => t.task_id === taskId)
       if (task) {
@@ -288,6 +300,7 @@ export const useTaskStore = defineStore('task', () => {
     fetchTaskStatus,
     fetchTasks,
     cancelTask,
+    deleteTask,
     retryTask,
     pauseTask,
     resumeTask,

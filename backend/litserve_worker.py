@@ -28,6 +28,7 @@ import multiprocessing
 import warnings
 import subprocess
 import tempfile
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -91,7 +92,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # Local imports
 from task_db import TaskDB
 from output_normalizer import normalize_output
-from utils import parse_list_arg, ALLOWED_UPLOAD_EXTENSIONS, copy_file, move_file
+from utils import (
+    parse_list_arg,
+    ALLOWED_UPLOAD_EXTENSIONS,
+    copy_file,
+    move_file,
+    sniff_office_file,
+    EncryptedDocumentError,
+    DocDecryptError,
+    cleanup_decrypted,
+    decrypted_dir,
+    decrypt_if_needed,
+)
 import importlib.util
 
 
@@ -518,7 +530,26 @@ class MinerUWorkerAPI(ls.LitAPI):
                 logger.warning(f"⚠️  Parent task {task_id} re-pulled while subtasks are unfinished, skipping")
             return
 
+        corrected_copy = None
+        decrypt_work_dir = None
         try:
+            # 0. 前置校验：文件必须存在且非空
+            # 空文件一路走到解析引擎，只会得到引擎内部的异常（PdfiumError 之类），
+            # 用户完全看不懂。这里提前拦下并给出人话错误。
+            self._validate_source_file(file_path)
+
+            # 0.3 加密文档前置解密（PDF / Office / ZIP）：密码来自提交时的 options。
+            # 未加密文件零成本直接通过；解密产物写到 output_dir/decrypted/{task_id}/，
+            # 任务结束时清理。必须在 Office 嗅探与 ZIP 解包之前，保证下游拿到明文副本。
+            decrypt_work_dir = decrypted_dir(self.output_dir, task_id)
+            file_path = decrypt_if_needed(file_path, Path(file_path).suffix, options.get("password"), decrypt_work_dir)
+
+            # 0.5 Office 文件按文件头识别真实格式（必须在路由判断之前）：
+            # 加密文件直接失败并说明原因；改了扩展名的旧版格式 / HTML 转交对应解析路径
+            corrected_copy = self._resolve_office_real_format(file_path, task.get("file_name"))
+            if corrected_copy:
+                file_path = str(corrected_copy)
+
             file_ext = Path(file_path).suffix.lower()
 
             # 表格文件在 auto 和 MinerU 系 backend（前端预设会传 pipeline / vlm / hybrid）下都改走 MarkItDown
@@ -533,11 +564,6 @@ class MinerUWorkerAPI(ls.LitAPI):
                 and not options.get("server_url")
             ):
                 self.vllm_controller.ensure_running(VLLM_MINERU_CONTAINER)
-
-            # 1.5 前置校验：文件必须存在且非空
-            # 空文件一路走到解析引擎，只会得到引擎内部的异常（PdfiumError 之类），
-            # 用户完全看不懂。这里提前拦下并给出人话错误。
-            self._validate_source_file(file_path)
 
             # 2. PDF 拆分
             if file_ext == ".pdf" and not parent_task_id:
@@ -590,7 +616,9 @@ class MinerUWorkerAPI(ls.LitAPI):
                 elif file_ext in [".mp4", ".avi", ".mkv", ".mov"] and VIDEO_ENGINE_AVAILABLE:
                     result = self._process_video(file_path, options)
                 elif file_ext in [".pdf", ".png", ".jpg", ".jpeg", ".docx", ".pptx"] and MINERU_PIPELINE_AVAILABLE:
-                    options["parse_mode"] = "pipeline"
+                    auto_backend = self._decide_auto_backend(file_path, file_ext)
+                    options["parse_mode"] = auto_backend
+                    logger.info(f"🔀 Auto engine selected: {auto_backend} for {Path(file_path).name} (ext={file_ext})")
                     result = self._process_with_mineru(file_path, options)
                 elif file_ext in [".doc", ".ppt"]:
                     # 旧版 Office 格式先用 LibreOffice 转为对应 OOXML 新格式，再走 MinerU 原生解析
@@ -668,6 +696,15 @@ class MinerUWorkerAPI(ls.LitAPI):
                 if parent_id_to_merge:
                     self._finalize_parent_task(parent_id_to_merge)
 
+        except DocDecryptError as e:
+            # 解密失败：文案已是友好中文，直接落库，不套 "TypeError: ..." 前缀
+            error_msg = str(e)
+            self.task_db.update_task_status(task_id, "failed", error_message=error_msg)
+            if parent_task_id:
+                self.task_db.on_child_task_failed(task_id, error_msg)
+            else:
+                self._enqueue_webhook(task_id, "task.failed")
+            raise
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
             self.task_db.update_task_status(task_id, "failed", error_message=error_msg)
@@ -676,6 +713,19 @@ class MinerUWorkerAPI(ls.LitAPI):
             else:
                 self._enqueue_webhook(task_id, "task.failed")
             raise
+        finally:
+            # 纠正扩展名用的临时副本，解析完即删除；原始上传文件保留（重试时还要用）
+            if corrected_copy:
+                try:
+                    Path(corrected_copy).unlink(missing_ok=True)
+                except OSError as cleanup_err:
+                    logger.debug(f"清理格式纠正副本失败 {corrected_copy}: {cleanup_err}")
+            # 解密产物随任务完成清理；清理失败绝不能阻塞任务
+            if decrypt_work_dir is not None:
+                try:
+                    cleanup_decrypted(decrypt_work_dir)
+                except Exception as cleanup_err:
+                    logger.debug(f"清理解密产物失败 {decrypt_work_dir}: {cleanup_err}")
 
     # -------------------------------------------------------------------------
     # Helper: 确保 PDF 存在于 Output 目录
@@ -719,6 +769,34 @@ class MinerUWorkerAPI(ls.LitAPI):
     # -------------------------------------------------------------------------
     # Engine Processor Implementations
     # -------------------------------------------------------------------------
+    def _decide_auto_backend(self, file_path: str, file_ext: str) -> str:
+        """auto 模式引擎启发式：大文档 / 扫描图像型 / 图片文件 -> hybrid；普通文本 -> pipeline。"""
+        try:
+            if file_ext == ".pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(file_path)
+                n = len(reader.pages)
+                pages = min(n, 5)
+                sample = 0
+                for i in range(pages):
+                    try:
+                        sample += len((reader.pages[i].extract_text() or "").strip())
+                    except Exception:
+                        pass
+                text_len = (sample / pages) if pages else 0
+                scanned = text_len < 100   # 几乎没有文本 -> 扫描件/图片型
+                if n > 40 or scanned:
+                    return "hybrid-auto-engine"
+                return "pipeline"
+            # 图片文件（截图/扫描图）常见复杂内容，VLM 更稳
+            if file_ext in [".png", ".jpg", ".jpeg"]:
+                return "hybrid-auto-engine"
+            # Office (docx/pptx) 走原生 MinerU
+            return "pipeline"
+        except Exception as e:
+            logger.warning(f"Auto backend heuristic failed ({e}), defaulting to pipeline")
+            return "pipeline"
+
     def _process_with_mineru(self, file_path: str, options: dict) -> dict:
         if self.mineru_pipeline_engine is None:
             from mineru_pipeline import MinerUPipelineEngine
@@ -893,6 +971,29 @@ class MinerUWorkerAPI(ls.LitAPI):
             raise ValueError(f"源文件内容为空（0 字节），无法解析: {path.name}")
 
         return size
+
+    @staticmethod
+    def _resolve_office_real_format(file_path: str, display_name: Optional[str] = None) -> Optional[Path]:
+        """按文件头识别 .xlsx / .docx / .pptx 的真实格式
+
+        - 加密（敏感度标签 / IRM / 打开密码）：抛 EncryptedDocumentError，不做任何绕过
+        - 旧版 .xls/.doc/.ppt 或 HTML 改了扩展名：复制一份正确扩展名的副本并返回其路径，
+          后续路由按真实格式走（调用方负责删除副本）；副本与原文件同名不同后缀，输出目录名不变
+        - 真正的 OOXML 或无法判断：返回 None，按原扩展名处理
+        """
+        result = sniff_office_file(file_path)
+        if result.kind == "encrypted":
+            raise EncryptedDocumentError(result.detail, display_name or Path(file_path).name)
+        if result.kind not in ("legacy", "html"):
+            return None
+
+        source = Path(file_path)
+        target = source.with_suffix(result.detail)
+        if target.exists():
+            target = source.with_name(f"{source.stem}.{uuid.uuid4().hex[:8]}{result.detail}")
+        copy_file(source, target)
+        logger.info(f"🔎 {source.name} is actually {result.detail} ({result.kind}), parsing as {target.name}")
+        return target
 
     def _convert_office_to_new_format(self, file_path: str) -> str:
         """将旧版 Office 格式转换为对应的 OOXML 新格式（供 MinerU 原生解析）。
