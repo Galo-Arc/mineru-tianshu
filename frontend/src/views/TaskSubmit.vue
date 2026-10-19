@@ -32,7 +32,7 @@
               class="flex-1"
             />
 
-            <div class="mt-6 pt-6 border-t border-gray-100 sticky bottom-0 bg-white/95 backdrop-blur z-10">
+            <div class="mt-6 pt-6 border-t border-gray-100 sticky bottom-0 bg-white z-10">
               <button
                 @click="submitTasks"
                 :disabled="files.length === 0 || submitting"
